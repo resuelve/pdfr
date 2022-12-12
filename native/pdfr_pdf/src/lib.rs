@@ -1,10 +1,28 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use lopdf::{Bookmark, Document, Object, ObjectId};
 
 #[rustler::nif]
 fn merge(pdfs_to_merge: Vec<&str>, merged_pdf_name: &str) -> Result<(), String> {
-    run_merge(pdfs_to_merge, merged_pdf_name)
+    match verify_missing_files(&pdfs_to_merge) {
+        Ok(_) => run_merge(pdfs_to_merge, merged_pdf_name),
+        error => error,
+    }
+}
+
+fn verify_missing_files(pdfs_to_merge: &Vec<&str>) -> Result<(), String> {
+    let not_existing_documents: Vec<&str> = pdfs_to_merge
+        .iter()
+        .cloned()
+        .filter(|&path| !Path::new(path).exists())
+        .collect();
+
+    if !not_existing_documents.is_empty() {
+        let error = format!("Missing files: {}", not_existing_documents.join(","));
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 fn run_merge(pdfs_to_merge: Vec<&str>, merged_pdf_name: &str) -> Result<(), String> {
