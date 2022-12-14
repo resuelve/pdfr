@@ -18,7 +18,7 @@ fn verify_missing_files(pdfs_to_merge: &Vec<&str>) -> Result<(), String> {
         .collect();
 
     if !not_existing_documents.is_empty() {
-        let error = format!("Missing files: {}", not_existing_documents.join(","));
+        let error = format!("Files do not exist: {}", not_existing_documents.join(","));
         return Err(error);
     }
 
