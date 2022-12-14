@@ -17,7 +17,7 @@ defmodule Pdfr do
         :ok
 
       {:error, error} ->
-        error
+        {:error, error}
     end
   end
 
