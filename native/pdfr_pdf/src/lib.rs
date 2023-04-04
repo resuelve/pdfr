@@ -1,36 +1,29 @@
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 use lopdf::{Bookmark, Document, Object, ObjectId};
 
+type DocumentBinaryData = Vec<u8>;
+
 #[rustler::nif]
 fn merge(pdfs_to_merge: Vec<&str>, merged_pdf_name: &str) -> Result<(), String> {
-    match verify_missing_files(&pdfs_to_merge) {
-        Ok(_) => run_merge(pdfs_to_merge, merged_pdf_name),
-        error => error,
-    }
-}
-
-fn verify_missing_files(pdfs_to_merge: &Vec<&str>) -> Result<(), String> {
-    let not_existing_documents: Vec<&str> = pdfs_to_merge
-        .iter()
-        .cloned()
-        .filter(|&path| !Path::new(path).exists())
-        .collect();
-
-    if !not_existing_documents.is_empty() {
-        let error = format!("Files do not exist: {}", not_existing_documents.join(","));
-        return Err(error);
-    }
-
-    Ok(())
-}
-
-fn run_merge(pdfs_to_merge: Vec<&str>, merged_pdf_name: &str) -> Result<(), String> {
     let documents: Vec<Document> = pdfs_to_merge
         .iter()
         .map(|path| Document::load(path).unwrap())
         .collect();
+    run_merge(documents, merged_pdf_name)
+}
 
+#[rustler::nif]
+fn merge_bin(pdfs_to_merge: Vec<DocumentBinaryData>, merged_pdf_name: &str) -> Result<(), String> {
+    let documents: Vec<Document> = pdfs_to_merge
+        .iter()
+        .map(|path| Document::load_mem(path).unwrap())
+        .collect();
+
+    run_merge(documents, merged_pdf_name)
+}
+
+fn run_merge(documents: Vec<Document>, merged_pdf_name: &str) -> Result<(), String> {
     // Define a starting max_id (will be used as start index for object_ids)
     let mut max_id = 1;
     let mut pagenum = 1;
@@ -206,4 +199,4 @@ fn run_merge(pdfs_to_merge: Vec<&str>, merged_pdf_name: &str) -> Result<(), Stri
     Ok(())
 }
 
-rustler::init!("Elixir.Pdfr.Pdf", [merge]);
+rustler::init!("Elixir.Pdfr.Pdf", [merge, merge_bin]);
