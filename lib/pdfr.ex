@@ -36,13 +36,13 @@ defmodule Pdfr do
   @doc """
   Merges all PDF iodata given into a single file
   """
-  @spec merge_bin([iodata()]) :: :ok | {:error, String.t()}
+  @spec merge_bin([iodata()]) :: {:ok, iodata} | {:error, String.t()}
   def merge_bin(documents) do
-    merged_name = "prueba_bin.pdf"
-
-    case Pdf.merge_bin(documents, merged_name) do
-      {:ok, _} ->
-        :ok
+    case Pdf.merge_bin(documents) do
+      {:ok, document} ->
+        # NIF responds with a u8 list so we need to convert it to a binary
+        binary = for b <- document, do: <<b::8>>, into: <<>>
+        {:ok, binary}
 
       {:error, error} ->
         {:error, error}

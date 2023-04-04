@@ -18,7 +18,7 @@ defmodule Mix.Tasks.Merge do
     end
   end
 
-  def run(["bin", merged_pdf_name | _]) do
+  def run(["bin" | _]) do
     pdfs =
       [
         "/Users/poncho/dev/test-files/pdf1_72.pdf",
@@ -33,7 +33,10 @@ defmodule Mix.Tasks.Merge do
       end)
 
     case Pdfr.merge_bin(pdfs) do
-      {:ok, _} ->
+      {:ok, bin_data} ->
+        f = File.open!("mergebin.pdf", [:write])
+        IO.binwrite(f, bin_data)
+        File.close(f)
         Mix.shell().info("PDF merged succesfuly")
 
       error ->
