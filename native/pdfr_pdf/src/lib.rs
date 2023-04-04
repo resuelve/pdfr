@@ -4,13 +4,18 @@ use lopdf::{Bookmark, Document, Object, ObjectId};
 
 type DocumentBinaryData = Vec<u8>;
 
+enum SaveMethod<'a> {
+    Buffer(&'a mut DocumentBinaryData),
+    File(&'a str),
+}
+
 #[rustler::nif]
 fn merge(pdfs_to_merge: Vec<&str>, merged_pdf_name: &str) -> Result<(), String> {
     let documents: Vec<Document> = pdfs_to_merge
         .iter()
         .map(|path| Document::load(path).unwrap())
         .collect();
-    run_merge(documents, merged_pdf_name, None)
+    run_merge(documents, SaveMethod::File(merged_pdf_name))
 }
 
 #[rustler::nif]
@@ -21,16 +26,14 @@ fn merge_bin(pdfs_to_merge: Vec<DocumentBinaryData>) -> Result<DocumentBinaryDat
         .collect();
 
     let mut buffer: DocumentBinaryData = vec![];
-    run_merge(documents, "", Some(&mut buffer));
 
-    Ok(buffer)
+    match run_merge(documents, SaveMethod::Buffer(&mut buffer)) {
+        Ok(_) => Ok(buffer),
+        Err(err) => Err(err),
+    }
 }
 
-fn run_merge(
-    documents: Vec<Document>,
-    merged_pdf_name: &str,
-    save_method: Option<&mut Vec<u8>>,
-) -> Result<(), String> {
+fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), String> {
     // Define a starting max_id (will be used as start index for object_ids)
     let mut max_id = 1;
     let mut pagenum = 1;
@@ -201,10 +204,13 @@ fn run_merge(
     // Save the merged PDF
     // Store file in current working directory.
     // Note: Line is exclude for when running tests
-    if let Some(buffer) = save_method {
-        document.save_to(buffer);
-    } else {
-        document.save(merged_pdf_name).unwrap();
+    match save_method {
+        SaveMethod::Buffer(buffer) => {
+            let _ = document.save_to(buffer);
+        }
+        SaveMethod::File(merged_pdf_name) => {
+            document.save(merged_pdf_name).unwrap();
+        }
     }
 
     Ok(())
