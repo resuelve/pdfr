@@ -5,12 +5,10 @@ defmodule Pdfr do
 
   alias Pdfr.Pdf
 
-  @typep nif_response :: {:ok, any()} | {:error, String.t()}
-
   @doc """
   Merges all specified PDF files into a single PDF
   """
-  @spec merge([String.t()], String.t()) :: nif_response
+  @spec merge([String.t()], String.t()) :: :ok | {:error, String.t()}
   def merge([_ | _] = pdfs_to_merge, merged_pdf_name) do
     case Pdf.merge(pdfs_to_merge, merged_pdf_name) do
       {:ok, _} ->
@@ -24,7 +22,7 @@ defmodule Pdfr do
   @doc """
   Merges all PDF files from the specfied directory into a single PDF
   """
-  @spec merge_all(String.t(), String.t()) :: nif_response
+  @spec merge_all(String.t(), String.t()) :: :ok | {:error, String.t()}
   def merge_all(dir_path, merged_pdf_name) do
     pdfs_to_merge =
       dir_path
@@ -33,5 +31,21 @@ defmodule Pdfr do
       |> Enum.map(&Path.join(dir_path, &1))
 
     merge(pdfs_to_merge, merged_pdf_name)
+  end
+
+  @doc """
+  Merges all PDF iodata given into a single file
+  """
+  @spec merge_bin([iodata()]) :: {:ok, iodata} | {:error, String.t()}
+  def merge_bin(documents) do
+    case Pdf.merge_bin(documents) do
+      {:ok, document} ->
+        # NIF responds with a u8 list so we need to convert it to a binary
+        binary = for b <- document, do: <<b::8>>, into: <<>>
+        {:ok, binary}
+
+      {:error, error} ->
+        {:error, error}
+    end
   end
 end
