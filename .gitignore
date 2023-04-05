@@ -25,3 +25,5 @@ pdfr-*.tar
 # Temporary files, for example, from tests.
 /tmp/
 *.pdf
+
+*.so
