@@ -38,6 +38,15 @@ defmodule Pdfr do
   """
   @spec merge_bin([iodata()]) :: {:ok, iodata} | {:error, String.t()}
   def merge_bin(documents) do
+    # We accept iodata but all documents should be passed as
+    # iolists to Rust so they can be converted to Vec<u8>
+    documents =
+      Enum.map(documents, fn
+        document when is_bitstring(document) -> :erlang.binary_to_list(document)
+        [_ | _] = document -> document
+        _ -> raise "Documents should be of iodata type"
+      end)
+
     case Pdf.merge_bin(documents) do
       {:ok, document} ->
         # NIF responds with a u8 list so we need to convert it to a binary
