@@ -7,6 +7,7 @@ defmodule Pdfr.MixProject do
       version: "0.2.1",
       elixir: "~> 1.12",
       start_permanent: Mix.env() == :prod,
+      aliases: aliases(),
       deps: deps()
     ]
   end
@@ -22,6 +23,17 @@ defmodule Pdfr.MixProject do
   defp deps do
     [
       {:rustler, "~> 0.26.0"}
+    ]
+  end
+
+  defp aliases do
+    [
+      ci: [
+        "hex.audit",
+        "deps.unlock --check-unused",
+        "format --check-formatted",
+        "test"
+      ]
     ]
   end
 end
