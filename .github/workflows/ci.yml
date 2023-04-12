@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build-and-test-rust:
+    name: Build and test Rust
+    runs-on: ubuntu-latest
+    container: alpine:3.17
+    defaults:
+      run:
+        working-directory: native/pdfr_pdf
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install build dependencies
+        run: |
+          apk add --update git make gcc rust cargo
+      - name: Install cargo dependencies
+        run: cargo build
+      - name: Run CI tests
+        run: |
+          cargo test
+
+  build-and-test-elixir:
+    name: Build and test Elixir
+    needs: build-and-test-rust
+    runs-on: ubuntu-latest
+    container: elixir:1.12-alpine
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install build dependencies
+        run: |
+          apk add --update bash openssl git make gcc rust cargo
+          mix local.hex --force && mix local.rebar --force
+      - name: Install elixir dependencies
+        run: mix deps.get
+      - name: Run CI tests
+        env:
+          MIX_ENV: test
+        run: mix ci
