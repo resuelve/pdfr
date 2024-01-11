@@ -4,8 +4,8 @@ defmodule Pdfr.MixProject do
   def project do
     [
       app: :pdfr,
-      version: "0.2.1",
-      elixir: "~> 1.12",
+      version: "0.3.0",
+      elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps()
@@ -22,7 +22,7 @@ defmodule Pdfr.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:rustler, "~> 0.26.0"}
+      {:rustler, "~> 0.30.0"}
     ]
   end
 
