@@ -27,7 +27,7 @@ jobs:
     name: Build and test Elixir
     needs: build-and-test-rust
     runs-on: ubuntu-latest
-    container: elixir:1.12-alpine
+    container: elixir:1.15-alpine
     steps:
       - uses: actions/checkout@v3
       - name: Install build dependencies
