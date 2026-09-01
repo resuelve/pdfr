@@ -10,5 +10,7 @@ name = "pdfr_pdf"
 path = "src/lib.rs"
 
 [dependencies]
-lopdf = "0.29.0"
+# El parser por defecto de lopdf es `pom_parser` y carga a ~650 ms por MB. `nom_parser` lee
+# los mismos documentos ~50x más rápido (los 19 PDFs de un contrato: 12.6 s -> 0.25 s).
+lopdf = { version = "0.29.0", default-features = false, features = ["chrono_time", "nom_parser"] }
 rustler = "0.30.0"

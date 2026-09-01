@@ -38,4 +38,26 @@ defmodule PdfrTest do
   test "merge_bin rechaza lo que no es iodata" do
     assert_raise RuntimeError, fn -> Pdfr.merge_bin([%{}]) end
   end
+
+  test "merge_bin acepta iolists y siempre devuelve un binario" do
+    nested = fixture("nested_three_pages.pdf")
+    flat = fixture("flat_two_pages.pdf")
+
+    # el mismo par, pero uno envuelto en iolist y el otro como charlist
+    assert {:ok, merged} = Pdfr.merge_bin([[nested], :binary.bin_to_list(flat)])
+
+    assert is_binary(merged)
+    assert length(Regex.scan(~r{/Type\s*/Page\b}, merged)) == 5
+  end
+
+  test "merge_bin devuelve {:error, _} con un documento malformado, sin tumbar la NIF" do
+    assert {:error, reason} = Pdfr.merge_bin(["not a pdf"])
+    assert is_binary(reason)
+
+    # y el proceso sigue de pie: la siguiente llamada buena responde igual
+    assert {:ok, merged} =
+             Pdfr.merge_bin([fixture("nested_three_pages.pdf"), fixture("flat_two_pages.pdf")])
+
+    assert is_binary(merged)
+  end
 end

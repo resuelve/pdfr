@@ -35,26 +35,22 @@ defmodule Pdfr do
 
   @doc """
   Merges all PDF iodata given into a single file
+
+  Every document is iodata: a binary, or an iolist that gets flattened here. The merged
+  PDF comes back as a binary.
   """
-  @spec merge_bin([iodata()]) :: {:ok, iodata} | {:error, String.t()}
+  @spec merge_bin([iodata()]) :: {:ok, binary()} | {:error, String.t()}
   def merge_bin(documents) do
-    # We accept iodata but all documents should be passed as
-    # iolists to Rust so they can be converted to Vec<u8>
+    # The NIF takes and returns binaries. An iolist is flattened once, here; travelling to
+    # Rust as a list of bytes and coming back as another one cost ~3.5 s and ~800 MB of heap
+    # for a 20 MB contract
     documents =
       Enum.map(documents, fn
-        document when is_bitstring(document) -> :erlang.binary_to_list(document)
-        [_ | _] = document -> document
+        document when is_binary(document) -> document
+        [_ | _] = document -> IO.iodata_to_binary(document)
         _ -> raise "Documents should be of iodata type"
       end)
 
-    case Pdf.merge_bin(documents) do
-      {:ok, document} ->
-        # NIF responds with a u8 list so we need to convert it to a binary
-        binary = for b <- document, do: <<b::8>>, into: <<>>
-        {:ok, binary}
-
-      {:error, error} ->
-        {:error, error}
-    end
+    Pdf.merge_bin(documents)
   end
 end

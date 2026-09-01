@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use lopdf::{Bookmark, Dictionary, Document, Object, ObjectId};
+use rustler::{Binary, Env, OwnedBinary};
 
 type DocumentBinaryData = Vec<u8>;
 
@@ -14,28 +15,45 @@ enum SaveMethod<'a> {
     File(&'a str),
 }
 
-#[rustler::nif]
+// Both NIFs are CPU bound and unbounded in the size of their input: merging one Mexican
+// contract (19 documents, 20 MB) takes hundreds of milliseconds even after this pass, and a
+// normal NIF holds its scheduler for the whole call. Measured before moving them off: a
+// 163 ms merge froze an unrelated BEAM process for 127 ms.
+#[rustler::nif(schedule = "DirtyCpu")]
 fn merge(pdfs_to_merge: Vec<&str>, merged_pdf_name: &str) -> Result<(), String> {
-    let documents: Vec<Document> = pdfs_to_merge
+    let documents = pdfs_to_merge
         .iter()
-        .map(|path| Document::load(path).unwrap())
-        .collect();
+        .map(|path| Document::load(path).map_err(|error| format!("{}: {}", path, error)))
+        .collect::<Result<Vec<Document>, String>>()?;
+
     run_merge(documents, SaveMethod::File(merged_pdf_name))
 }
 
-#[rustler::nif]
-fn merge_bin(pdfs_to_merge: Vec<DocumentBinaryData>) -> Result<DocumentBinaryData, String> {
-    let documents: Vec<Document> = pdfs_to_merge
+#[rustler::nif(schedule = "DirtyCpu")]
+fn merge_bin<'a>(env: Env<'a>, pdfs_to_merge: Vec<Binary<'a>>) -> Result<Binary<'a>, String> {
+    // The documents arrive as binaries and leave as one binary: going through Erlang lists
+    // meant a term per byte in both directions, ~3.5 s and ~800 MB of heap per contract
+    let documents = pdfs_to_merge
         .iter()
-        .map(|path| Document::load_mem(path).unwrap())
-        .collect();
+        .enumerate()
+        .map(|(index, document)| {
+            Document::load_mem(document.as_slice())
+                .map_err(|error| format!("Document {}: {}", index, error))
+        })
+        .collect::<Result<Vec<Document>, String>>()?;
 
     let mut buffer: DocumentBinaryData = vec![];
+    run_merge(documents, SaveMethod::Buffer(&mut buffer))?;
 
-    match run_merge(documents, SaveMethod::Buffer(&mut buffer)) {
-        Ok(_) => Ok(buffer),
-        Err(err) => Err(err),
-    }
+    let mut merged = OwnedBinary::new(buffer.len()).ok_or_else(|| {
+        format!(
+            "Could not allocate {} bytes for the merged PDF",
+            buffer.len()
+        )
+    })?;
+    merged.as_mut_slice().copy_from_slice(&buffer);
+
+    Ok(merged.release(env))
 }
 
 /// Value of `key` for a page, looked up the /Parent chain when the page itself doesn't
@@ -111,21 +129,25 @@ fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), St
     // Catalog is mandatory
     let mut catalog_object: Option<(ObjectId, Object)> = None;
 
-    // Process all objects except "Page" and "Pages" types
-    for (object_id, object) in documents_objects.iter() {
+    // Process all objects except "Page" and "Pages" types.
+    // Consumed by value: the inputs are dropped right after this, and cloning every object of
+    // a 20 MB contract duplicated the whole content stream set for nothing
+    for (object_id, object) in documents_objects {
         // We have to ignore "Page" (as are processed later), "Pages", "Outlines" and "Outline"
         // objects. All other objects should be collected and inserted into the main Document
 
-        match object.type_name().unwrap_or("") {
+        let type_name = object.type_name().unwrap_or("");
+
+        match type_name {
             "Catalog" => {
                 // Collect a first "Catalog" object and use it for the future "Pages"
                 catalog_object = Some((
                     if let Some((id, _)) = catalog_object {
                         id
                     } else {
-                        *object_id
+                        object_id
                     },
-                    object.clone(),
+                    object,
                 ));
             }
             // Every /Pages node of the inputs is dropped, the root of each document and the
@@ -139,7 +161,7 @@ fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), St
             "Outlines" => {} // Ignored, not supported yet
             "Outline" => {}  // Ignored, not supported yet
             _ => {
-                document.objects.insert(*object_id, object.clone());
+                document.objects.insert(object_id, object);
             }
         }
     }
@@ -191,11 +213,19 @@ fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), St
 
     document.trailer.set("Root", catalog_object.0);
 
-    // Update the max internal ID as wasn't updated before due to direct objects insertion
-    document.max_id = document.objects.len() as u32;
-
-    // Reorder all new Document objects
-    document.renumber_objects();
+    // Update the max internal ID as wasn't updated before due to direct objects insertion.
+    // It has to be the highest id actually present, not `objects.len()`: the ids are unique
+    // (each input was renumbered above a running counter) but sparse, because every /Pages
+    // node of the inputs was dropped. lopdf writes the xref table as `1..max_id + 1`, so an
+    // id past `max_id` is written into the file yet left out of the table — present on disk
+    // and unreachable on the next read. Renumbering into 1..n instead, as this did before,
+    // hid the gap at a cost of ~0.9 s per contract and bought nothing else
+    document.max_id = document
+        .objects
+        .keys()
+        .map(|(id, _)| *id)
+        .max()
+        .unwrap_or(0);
 
     //Set any Bookmarks to the First child if they are not set to a page
     document.adjust_zero_pages();
@@ -211,16 +241,16 @@ fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), St
 
     document.compress();
 
-    // Save the merged PDF
-    // Store file in current working directory.
-    // Note: Line is exclude for when running tests
+    // Save the merged PDF. A write that fails has to travel back as an error: swallowing it
+    // handed the caller a truncated buffer as {:ok, _}, and panicking took the NIF with it
     match save_method {
-        SaveMethod::Buffer(buffer) => {
-            let _ = document.save_to(buffer);
-        }
-        SaveMethod::File(merged_pdf_name) => {
-            document.save(merged_pdf_name).unwrap();
-        }
+        SaveMethod::Buffer(buffer) => document
+            .save_to(buffer)
+            .map_err(|error| format!("Could not write the merged PDF: {}", error))?,
+        SaveMethod::File(merged_pdf_name) => document
+            .save(merged_pdf_name)
+            .map(|_| ())
+            .map_err(|error| format!("Could not save {}: {}", merged_pdf_name, error))?,
     }
 
     Ok(())
@@ -371,6 +401,38 @@ mod tests {
             .collect();
 
         assert_eq!(widths, vec![595, 595, 612, 612, 612]);
+    }
+
+    /// Guard for the id space now that the final `renumber_objects()` is gone: the writer
+    /// builds the xref as `1..max_id + 1`, so an object numbered past `max_id` never makes it
+    /// into the table and the next read simply doesn't see it. With `max_id = objects.len()`
+    /// — the ids are sparse — the pages survive but the streams they point at are dropped.
+    #[test]
+    fn every_object_of_the_merged_document_fits_in_the_declared_id_space() {
+        let merged = merge_into_memory(vec![nested_document(), flat_document()]);
+
+        let highest = merged.objects.keys().map(|(id, _)| *id).max().unwrap();
+        assert!(
+            merged.max_id >= highest,
+            "the xref declares {} ids but the document reaches {}",
+            merged.max_id,
+            highest
+        );
+
+        // and everything the page tree hangs off has to be reachable through it
+        assert_eq!(merged.get_pages().len(), 5);
+
+        for (number, page_id) in merged.get_pages() {
+            let page = merged.get_object(page_id).unwrap().as_dict().unwrap();
+            let contents = page.get(b"Contents").unwrap().as_reference().unwrap();
+
+            assert!(
+                merged.get_object(contents).is_ok(),
+                "page {} lost its contents {:?}",
+                number,
+                contents
+            );
+        }
     }
 
     #[test]
