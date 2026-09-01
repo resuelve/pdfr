@@ -1,8 +1,13 @@
 use std::collections::BTreeMap;
 
-use lopdf::{Bookmark, Document, Object, ObjectId};
+use lopdf::{Bookmark, Dictionary, Document, Object, ObjectId};
 
 type DocumentBinaryData = Vec<u8>;
+
+/// Entries a page inherits from its ancestors in the page tree when it doesn't define
+/// them itself (PDF 32000-1:2008, 7.7.3.4). The merged document keeps a single /Pages
+/// node, so they are copied onto each page before the original nodes are dropped.
+const INHERITABLE_ENTRIES: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 
 enum SaveMethod<'a> {
     Buffer(&'a mut DocumentBinaryData),
@@ -33,6 +38,24 @@ fn merge_bin(pdfs_to_merge: Vec<DocumentBinaryData>) -> Result<DocumentBinaryDat
     }
 }
 
+/// Value of `key` for a page, looked up the /Parent chain when the page itself doesn't
+/// define it. Bounded so a malformed /Parent cycle can't loop forever.
+fn inherited_entry(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Object> {
+    let mut node_id = page_id;
+
+    for _ in 0..64 {
+        let node = doc.get_object(node_id).ok()?.as_dict().ok()?;
+
+        if let Ok(value) = node.get(key) {
+            return Some(value.clone());
+        }
+
+        node_id = node.get(b"Parent").ok()?.as_reference().ok()?;
+    }
+
+    None
+}
+
 fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), String> {
     // Define a starting max_id (will be used as start index for object_ids)
     let mut max_id = 1;
@@ -48,37 +71,50 @@ fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), St
 
         max_id = doc.max_id + 1;
 
-        documents_pages.extend(
-            doc.get_pages()
-                .into_iter()
-                .map(|(_, object_id)| {
-                    if !first {
-                        let bookmark = Bookmark::new(
-                            String::from(format!("Page_{}", pagenum)),
-                            [0.0, 0.0, 1.0],
-                            0,
-                            object_id,
-                        );
-                        document.add_bookmark(bookmark, None);
-                        first = true;
-                        pagenum += 1;
-                    }
+        for (_, object_id) in doc.get_pages() {
+            if !first {
+                let bookmark =
+                    Bookmark::new(format!("Page_{}", pagenum), [0.0, 0.0, 1.0], 0, object_id);
+                document.add_bookmark(bookmark, None);
+                first = true;
+                pagenum += 1;
+            }
 
-                    (object_id, doc.get_object(object_id).unwrap().to_owned())
-                })
-                .collect::<BTreeMap<ObjectId, Object>>(),
-        );
+            let mut page = match doc.get_object(object_id).and_then(Object::as_dict) {
+                Ok(dictionary) => dictionary.clone(),
+                Err(_) => continue,
+            };
+
+            // The page is about to lose its ancestors, so whatever it inherited from them
+            // has to travel with it
+            for &key in INHERITABLE_ENTRIES.iter() {
+                if !page.has(key) {
+                    if let Some(value) = inherited_entry(&doc, object_id, key) {
+                        page.set(key, value);
+                    }
+                }
+            }
+
+            documents_pages.insert(object_id, Object::Dictionary(page));
+        }
+
         documents_objects.extend(doc.objects);
     }
 
-    // Catalog and Pages are mandatory
-    let mut catalog_object: Option<(ObjectId, Object)> = None;
-    let mut pages_object: Option<(ObjectId, Object)> = None;
+    if documents_pages.is_empty() {
+        return Err("No pages found in the documents to merge".to_string());
+    }
 
-    // Process all objects except "Page" type
+    // A fresh root for the page tree, with an id above every renumbered object
+    let pages_root_id: ObjectId = (max_id, 0);
+
+    // Catalog is mandatory
+    let mut catalog_object: Option<(ObjectId, Object)> = None;
+
+    // Process all objects except "Page" and "Pages" types
     for (object_id, object) in documents_objects.iter() {
-        // We have to ignore "Page" (as are processed later), "Outlines" and "Outline" objects
-        // All other objects should be collected and inserted into the main Document
+        // We have to ignore "Page" (as are processed later), "Pages", "Outlines" and "Outline"
+        // objects. All other objects should be collected and inserted into the main Document
 
         match object.type_name().unwrap_or("") {
             "Catalog" => {
@@ -92,27 +128,13 @@ fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), St
                     object.clone(),
                 ));
             }
-            "Pages" => {
-                // Collect and update a first "Pages" object and use it for the future "Catalog"
-                // We have also to merge all dictionaries of the old and the new "Pages" object
-                if let Ok(dictionary) = object.as_dict() {
-                    let mut dictionary = dictionary.clone();
-                    if let Some((_, ref object)) = pages_object {
-                        if let Ok(old_dictionary) = object.as_dict() {
-                            dictionary.extend(old_dictionary);
-                        }
-                    }
-
-                    pages_object = Some((
-                        if let Some((id, _)) = pages_object {
-                            id
-                        } else {
-                            *object_id
-                        },
-                        Object::Dictionary(dictionary),
-                    ));
-                }
-            }
+            // Every /Pages node of the inputs is dropped, the root of each document and the
+            // intermediate nodes alike, and the pages are re-parented to the fresh root
+            // built below. Folding their dictionaries into one, as the lopdf merge example
+            // did, turned the /Parent of the intermediate nodes into an array on the merged
+            // root (qpdf: "root of pages tree has no /Kids array") and would do the same to
+            // any inheritable entry they carried
+            "Pages" => {}
             "Page" => {}     // Ignored, processed later and separately
             "Outlines" => {} // Ignored, not supported yet
             "Outline" => {}  // Ignored, not supported yet
@@ -122,16 +144,17 @@ fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), St
         }
     }
 
-    // If no "Pages" found abort
-    if pages_object.is_none() {
-        return Err("Pages root not found".to_string());
-    }
+    // If no "Catalog" found abort
+    let catalog_object = match catalog_object {
+        Some(catalog_object) => catalog_object,
+        None => return Err("Catalog root not found".to_string()),
+    };
 
-    // Iter over all "Page" and collect with the parent "Pages" created before
+    // Iter over all "Page" and hang them from the new root
     for (object_id, object) in documents_pages.iter() {
         if let Ok(dictionary) = object.as_dict() {
             let mut dictionary = dictionary.clone();
-            dictionary.set("Parent", pages_object.as_ref().unwrap().0);
+            dictionary.set("Parent", pages_root_id);
 
             document
                 .objects
@@ -139,39 +162,26 @@ fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), St
         }
     }
 
-    // If no "Catalog" found abort
-    if catalog_object.is_none() {
-        return Err("Catalog root not found".to_string());
-    }
+    // Build the new "Pages" root: only the pages, in document order
+    let mut pages_root = Dictionary::new();
+    pages_root.set("Type", Object::Name(b"Pages".to_vec()));
+    pages_root.set("Count", documents_pages.len() as u32);
+    pages_root.set(
+        "Kids",
+        documents_pages
+            .keys()
+            .map(|object_id| Object::Reference(*object_id))
+            .collect::<Vec<_>>(),
+    );
 
-    let catalog_object = catalog_object.unwrap();
-    let pages_object = pages_object.unwrap();
-
-    // Build a new "Pages" with updated fields
-    if let Ok(dictionary) = pages_object.1.as_dict() {
-        let mut dictionary = dictionary.clone();
-
-        // Set new pages count
-        dictionary.set("Count", documents_pages.len() as u32);
-
-        // Set new "Kids" list (collected from documents pages) for "Pages"
-        dictionary.set(
-            "Kids",
-            documents_pages
-                .into_iter()
-                .map(|(object_id, _)| Object::Reference(object_id))
-                .collect::<Vec<_>>(),
-        );
-
-        document
-            .objects
-            .insert(pages_object.0, Object::Dictionary(dictionary));
-    }
+    document
+        .objects
+        .insert(pages_root_id, Object::Dictionary(pages_root));
 
     // Build a new "Catalog" with updated fields
     if let Ok(dictionary) = catalog_object.1.as_dict() {
         let mut dictionary = dictionary.clone();
-        dictionary.set("Pages", pages_object.0);
+        dictionary.set("Pages", pages_root_id);
         dictionary.remove(b"Outlines"); // Outlines not supported in merged PDFs
 
         document
@@ -217,3 +227,159 @@ fn run_merge(documents: Vec<Document>, save_method: SaveMethod) -> Result<(), St
 }
 
 rustler::init!("Elixir.Pdfr.Pdf", [merge, merge_bin]);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::Stream;
+
+    fn name(value: &str) -> Object {
+        Object::Name(value.as_bytes().to_vec())
+    }
+
+    fn media_box(width: i64, height: i64) -> Object {
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(width),
+            Object::Integer(height),
+        ])
+    }
+
+    fn page(doc: &mut Document, parent: ObjectId, media_box: Option<Object>) -> ObjectId {
+        let contents = doc.add_object(Stream::new(Dictionary::new(), b"".to_vec()));
+        let mut page = Dictionary::new();
+        page.set("Type", name("Page"));
+        page.set("Parent", parent);
+        page.set("Contents", contents);
+        if let Some(media_box) = media_box {
+            page.set("MediaBox", media_box);
+        }
+        doc.add_object(page)
+    }
+
+    fn finish(doc: &mut Document, pages_root: ObjectId, kids: Vec<ObjectId>, count: u32) {
+        let mut root = Dictionary::new();
+        root.set("Type", name("Pages"));
+        root.set("Count", count);
+        root.set(
+            "Kids",
+            kids.into_iter().map(Object::Reference).collect::<Vec<_>>(),
+        );
+        doc.objects.insert(pages_root, Object::Dictionary(root));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", name("Catalog"));
+        catalog.set("Pages", pages_root);
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+    }
+
+    /// Two pages straight under the root, each with its own MediaBox: what pypdf writes
+    fn flat_document() -> Document {
+        let mut doc = Document::with_version("1.4");
+        let pages_root = doc.new_object_id();
+        let kids = vec![
+            page(&mut doc, pages_root, Some(media_box(612, 792))),
+            page(&mut doc, pages_root, Some(media_box(612, 792))),
+        ];
+        finish(&mut doc, pages_root, kids, 2);
+        doc
+    }
+
+    /// Three pages, the first two under an intermediate node that owns the MediaBox they
+    /// inherit: the shape of Word and Google Docs exports, which qpdf preserves
+    fn nested_document() -> Document {
+        let mut doc = Document::with_version("1.4");
+        let pages_root = doc.new_object_id();
+        let intermediate = doc.new_object_id();
+
+        let under_intermediate = vec![
+            page(&mut doc, intermediate, None),
+            page(&mut doc, intermediate, None),
+        ];
+        let mut node = Dictionary::new();
+        node.set("Type", name("Pages"));
+        node.set("Parent", pages_root);
+        node.set("Count", 2u32);
+        node.set("MediaBox", media_box(595, 842));
+        node.set(
+            "Kids",
+            under_intermediate
+                .into_iter()
+                .map(Object::Reference)
+                .collect::<Vec<_>>(),
+        );
+        doc.objects.insert(intermediate, Object::Dictionary(node));
+
+        let third = page(&mut doc, pages_root, Some(media_box(612, 792)));
+        finish(&mut doc, pages_root, vec![intermediate, third], 3);
+        doc
+    }
+
+    fn merge_into_memory(documents: Vec<Document>) -> Document {
+        let mut buffer = vec![];
+        run_merge(documents, SaveMethod::Buffer(&mut buffer)).unwrap();
+        Document::load_mem(&buffer).unwrap()
+    }
+
+    #[test]
+    fn the_merged_document_has_a_single_flat_page_tree() {
+        let merged = merge_into_memory(vec![nested_document(), flat_document()]);
+
+        let root_id = merged
+            .catalog()
+            .unwrap()
+            .get(b"Pages")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let root = merged.get_object(root_id).unwrap().as_dict().unwrap();
+
+        // the defect: a /Parent array on the root, inherited from the intermediate nodes
+        assert!(!root.has(b"Parent"));
+        assert_eq!(root.get(b"Count").unwrap().as_i64().unwrap(), 5);
+
+        let kids = root.get(b"Kids").unwrap().as_array().unwrap();
+        assert_eq!(kids.len(), 5);
+        for kid in kids {
+            let kid = merged
+                .get_object(kid.as_reference().unwrap())
+                .unwrap()
+                .as_dict()
+                .unwrap();
+            assert_eq!(kid.get(b"Type").unwrap().as_name().unwrap(), b"Page");
+            assert_eq!(kid.get(b"Parent").unwrap().as_reference().unwrap(), root_id);
+        }
+
+        assert_eq!(merged.get_pages().len(), 5);
+    }
+
+    #[test]
+    fn pages_keep_what_they_inherited_from_the_dropped_nodes() {
+        let merged = merge_into_memory(vec![nested_document(), flat_document()]);
+
+        let widths: Vec<i64> = merged
+            .get_pages()
+            .values()
+            .map(|page_id| {
+                let page = merged.get_object(*page_id).unwrap().as_dict().unwrap();
+                page.get(b"MediaBox").unwrap().as_array().unwrap()[2]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(widths, vec![595, 595, 612, 612, 612]);
+    }
+
+    #[test]
+    fn merging_nothing_with_pages_is_an_error() {
+        let mut doc = Document::with_version("1.4");
+        let pages_root = doc.new_object_id();
+        finish(&mut doc, pages_root, vec![], 0);
+
+        let mut buffer = vec![];
+        assert!(run_merge(vec![doc], SaveMethod::Buffer(&mut buffer)).is_err());
+    }
+}

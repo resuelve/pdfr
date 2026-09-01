@@ -4,7 +4,7 @@ defmodule Pdfr.MixProject do
   def project do
     [
       app: :pdfr,
-      version: "0.3.0",
+      version: "0.3.1",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),

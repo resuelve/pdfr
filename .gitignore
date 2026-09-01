@@ -25,5 +25,6 @@ pdfr-*.tar
 # Temporary files, for example, from tests.
 /tmp/
 *.pdf
+!/test/fixtures/*.pdf
 
 *.so
